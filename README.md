@@ -1,108 +1,126 @@
-# Discord Reminder Bot, versi Serverless (Vercel + cron eksternal)
+# Discord Reminder Bot, Serverless version (Vercel + external cron)
 
-Bot pengingat mingguan yang **berjalan sepenuhnya di Vercel** tanpa server atau proses yang hidup terus.
+A weekly reminder bot that runs **entirely on Vercel**, with no server or always-on process.
 
-## Cara kerjanya
+## How it works
 
-| Bagian | Endpoint | Fungsi |
+| Part | Endpoint | Purpose |
 |---|---|---|
-| Slash command | `POST /api/interactions` | Discord mengirim webhook tiap ada `/reminder ...`. Tanda tangan diverifikasi memakai **Public Key**. |
-| Pengiriman reminder | `GET /api/cron` | Dipanggil **tiap menit** oleh cron eksternal gratis (cron-job.org). Mengecek reminder yang jatuh tempo lalu mengirimnya lewat REST API Discord. |
-| Database | PostgreSQL (Vercel/Prisma/Neon, dll.) | Sama seperti sebelumnya. |
+| Slash commands | `POST /api/interactions` | Discord sends a webhook for every `/reminder ...` command. The signature is verified with the **Public Key**. |
+| Reminder delivery | `GET /api/cron` | Called **every minute** by a free external cron service (cron-job.org). It checks which reminders are due and sends them through the Discord REST API. |
+| Database | PostgreSQL (Vercel/Prisma/Neon, etc.) | Same as before. |
 
-Tidak ada koneksi Gateway, jadi bot akan tampil **offline** di daftar member, tetapi slash command dan reminder tetap berfungsi.
+There is no Gateway connection, so the bot shows as **offline** in the member list, but slash commands and reminders work normally.
 
-Kenapa cron eksternal: cron bawaan Vercel di paket Hobby hanya boleh sekali sehari, jadi tidak cocok untuk jadwal tepat waktu.
+Why an external cron: the built-in Vercel cron on the Hobby plan may only run once a day, which is not suitable for precisely timed reminders.
 
-## Perbedaan dari versi lama
+## Differences from the old version
 
-- Tidak ada `client.login()`, `node-cron`, atau PM2.
-- **Jendela toleransi (`CATCHUP_MINUTES`, default 5):** kalau panggilan cron terlambat atau terlewat satu menit, reminder tetap terkirim selama masih dalam jendela itu. Reminder jam 23:59 tetap terkirim bila panggilan baru masuk setelah tengah malam.
-- **Anti-ganda atomik:** reminder "diklaim" di database sebelum dikirim, jadi dua panggilan cron yang tumpang tindih tidak akan mengirim dua kali. Kalau pengiriman gagal, klaim dikembalikan dan dicoba lagi di menit berikutnya.
-- Timestamp di pesan memakai **jam jadwal sebenarnya**, bukan jam saat pesan dikirim.
-- `/reminder list` kini juga menampilkan role yang di-mention.
+- No `client.login()`, `node-cron`, or PM2.
+- **Catch-up window (`CATCHUP_MINUTES`, default 5):** if a cron call is late or skipped for a minute, the reminder is still sent as long as it is within the window. A 23:59 reminder is still sent if the call only arrives after midnight.
+- **Atomic anti-duplicate:** a reminder is "claimed" in the database before it is sent, so two overlapping cron calls can never send it twice. If sending fails, the claim is released and retried on the next minute.
+- The timestamp in the message uses the **actual scheduled time**, not the time the message was sent.
+- `/reminder list` now also shows the mentioned role.
 
-## Langkah setup
+## Maintenance Schedule feature
 
-### 1. Siapkan database
-Di komputermu (butuh `.env`, lihat langkah 2):
+Three additional slash commands (registered together with `/reminder` by `npm run deploy-commands`):
+
+| Command | Purpose |
+|---|---|
+| `/find_schedule` | Reads the Notices tab of The Seven Deadly Sins: Origin using the logic in `lib/maintenance_checker.js`, finds the **Maintenance Schedule** article, and replies with the hour the maintenance **ends**, e.g. `09:00 UTC`. The reply is a "thinking..." message that is replaced by the result, because reading the site can take longer than Discord's 3-second limit. |
+| `/maintenance_schedule` | Adds a weekly reminder for a maintenance schedule. Options: `weekday`, `time` (**UTC**, e.g. `09:00`; `09:00 UTC` is also accepted), `channel`, then optional `message`, `role`, `mention`. |
+| `/maintenance_schedule_update` | Changes the time (UTC) of an existing maintenance schedule. Options: `id` and `time`. Only works for schedules created with `/maintenance_schedule`, not for regular reminders. |
+
+Notes:
+- Maintenance schedules are stored in the `reminders` table with the column `kind = 'maintenance'` and timezone `UTC`, so they are delivered by the same `/api/cron`. Their IDs appear in `/reminder list` (marked with 🔧) and they can be removed with `/reminder delete`.
+- When the time is changed, the "already sent today" marker is reset so the new time can still fire on the same day.
+- `vercel.json` gives `api/interactions.js` a 60-second duration limit for `/find_schedule`.
+- **After updating: run `npm install`, `npm run setup-db` (adds the `kind` column), then `npm run deploy-commands`, and redeploy.** Without `setup-db`, `/reminder list` and `/maintenance_schedule` will fail because the `kind` column does not exist yet.
+- If `/find_schedule` returns `Access Denied`, the site's server is rejecting requests from Vercel's IPs; see the message in `lib/maintenance_checker.js`. The `DETAIL_URL_TEMPLATE` environment variable is still supported.
+
+## Setup steps
+
+### 1. Prepare the database
+On your computer (needs `.env`, see step 2):
 ```bash
 npm install
 npm run setup-db
 ```
-Perintah ini membuat tabel `reminders` (lengkap dengan `role_id`). Aman dijalankan ulang dan juga menambah kolom `role_id` pada tabel lama.
+This creates the `reminders` table (including `role_id` and `kind`). It is safe to run again, and it also adds the `role_id` and `kind` columns to an older table.
 
-### 2. Isi `.env` lokal
-Salin `.env.example` menjadi `.env`, lalu isi. Buat `CRON_SECRET` dengan:
+### 2. Fill in the local `.env`
+Copy `.env.example` to `.env` and fill it in. Generate `CRON_SECRET` with:
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
-`DISCORD_PUBLIC_KEY` ada di Developer Portal, **General Information → Public Key**.
+`DISCORD_PUBLIC_KEY` is in the Developer Portal under **General Information → Public Key**.
 
-### 3. Deploy ke Vercel
-1. Taruh seluruh isi folder ini di repository GitHub yang tersambung ke proyek Vercel-mu (ganti isi lama). **Jangan commit `.env`.**
-2. Di Vercel: **Project → Settings → Environment Variables**, tambahkan:
-   `DISCORD_TOKEN`, `DISCORD_PUBLIC_KEY`, `DATABASE_URL`, `CRON_SECRET`, `CATCHUP_MINUTES` (opsional), `DEFAULT_TIMEZONE`.
-   (`CLIENT_ID` dan `GUILD_ID` hanya dipakai lokal untuk mendaftarkan command.)
-3. Pastikan **Framework Preset = Other** dan Root Directory menunjuk ke folder ini.
-4. Deploy ulang setelah env var disimpan.
+### 3. Deploy to Vercel
+1. Put the whole contents of this folder in the GitHub repository connected to your Vercel project (replacing the old contents). **Do not commit `.env`.**
+2. In Vercel: **Project → Settings → Environment Variables**, add:
+   `DISCORD_TOKEN`, `DISCORD_PUBLIC_KEY`, `DATABASE_URL`, `CRON_SECRET`, `CATCHUP_MINUTES` (optional), `DEFAULT_TIMEZONE`.
+   (`CLIENT_ID` and `GUILD_ID` are only used locally to register commands.)
+3. Make sure **Framework Preset = Other** and the Root Directory points to this folder.
+4. Redeploy after saving the environment variables.
 
-### 4. Hubungkan Discord ke Vercel
-1. Developer Portal → aplikasimu → **General Information** → **Interactions Endpoint URL**.
-2. Isi: `https://NAMA-PROYEKMU.vercel.app/api/interactions` lalu **Save Changes**.
-3. Discord langsung mengirim tes (PING). Kalau muncul pesan sukses, endpoint sudah benar.
+### 4. Connect Discord to Vercel
+1. Developer Portal → your application → **General Information** → **Interactions Endpoint URL**.
+2. Enter `https://YOUR-PROJECT.vercel.app/api/interactions` and click **Save Changes**.
+3. Discord immediately sends a test (PING). If a success message appears, the endpoint is correct.
 
-Daftarkan command (cukup sekali, atau saat `lib/commands.js` berubah):
+Register the commands (only once, or whenever `lib/commands.js` changes):
 ```bash
 npm run deploy-commands
 ```
 
-> Setelah Interactions Endpoint URL diisi, Discord tidak lagi mengirim interaksi lewat Gateway. **Matikan bot versi lama** (PM2 atau `npm start` di PC) supaya tidak ada dua proses.
+> Once the Interactions Endpoint URL is set, Discord no longer sends interactions through the Gateway. **Turn off the old bot** (PM2 or `npm start` on a PC) so there are not two processes.
 
-### 5. Pasang cron eksternal (gratis)
-Contoh di https://cron-job.org (gratis, minimal interval satu menit, mendukung custom header):
+### 5. Set up the external cron (free)
+Example with https://cron-job.org (free, minimum interval of one minute, supports custom headers):
 
-1. Buat akun, lalu **Create cronjob**.
-2. **URL:** `https://NAMA-PROYEKMU.vercel.app/api/cron`
-3. **Schedule:** setiap 1 menit.
-4. Tab **Advanced → Headers**, tambahkan: `Authorization` = `Bearer ISI_CRON_SECRET_KAMU`
-5. Method **GET**, simpan, lalu klik **Test run**. Hasil yang benar:
+1. Create an account, then **Create cronjob**.
+2. **URL:** `https://YOUR-PROJECT.vercel.app/api/cron`
+3. **Schedule:** every 1 minute.
+4. Tab **Advanced → Headers**, add: `Authorization` = `Bearer YOUR_CRON_SECRET`
+5. Method **GET**, save, then click **Test run**. A correct result looks like:
    ```json
    {"checked":9,"sent":[],"skipped":0,"errors":[]}
    ```
-   (`sent` terisi hanya saat ada reminder yang jatuh tempo.)
+   (`sent` is only filled when a reminder is due.)
 
-Kalau layananmu tidak mendukung custom header, pakai `https://.../api/cron?secret=ISI_CRON_SECRET`. Header lebih aman karena URL bisa tercatat di log.
+If your service does not support custom headers, use `https://.../api/cron?secret=YOUR_CRON_SECRET`. The header is safer because URLs may be written to logs.
 
-## Pengujian
+## Testing
 
 ```bash
 npm test
 ```
-Menjalankan 21 pengecekan offline (tanpa database dan tanpa Discord): verifikasi tanda tangan, parsing command, logika jadwal (termasuk lewat tengah malam dan zona waktu), autentikasi cron, anti-ganda, dan retry.
+Runs 32 offline checks (no database and no Discord): signature verification, command parsing, schedule logic (including past midnight and timezones), cron authentication, anti-duplicate, retry, and the maintenance schedule commands.
 
-Tes manual endpoint cron dari terminal:
+Manual test of the cron endpoint from a terminal:
 ```bash
-curl -H "Authorization: Bearer ISI_CRON_SECRET" https://NAMA-PROYEKMU.vercel.app/api/cron
+curl -H "Authorization: Bearer YOUR_CRON_SECRET" https://YOUR-PROJECT.vercel.app/api/cron
 ```
 
 ## Troubleshooting
 
-| Gejala | Penyebab dan solusi |
+| Symptom | Cause and solution |
 |---|---|
-| Discord menolak Interactions Endpoint URL | `DISCORD_PUBLIC_KEY` belum diisi atau belum redeploy. Atau **Deployment Protection** Vercel memblokir request: buka Settings → Deployment Protection dan matikan Vercel Authentication untuk production. Cek dengan `curl -X POST https://.../api/interactions`; hasilnya harus `invalid request signature`, bukan halaman login HTML. |
-| `The application did not respond` | Discord butuh balasan dalam 3 detik. Cek **Vercel → Logs**. Biasanya `DATABASE_URL` salah atau database lambat saat cold start. Coba lagi, request kedua biasanya lebih cepat. |
-| `/reminder` tidak muncul | Jalankan `npm run deploy-commands`, lalu restart Discord (Ctrl+R). |
-| Cron test run mengembalikan 401 | Header `Authorization` salah atau `CRON_SECRET` di Vercel berbeda. Redeploy setelah mengubah env var. |
-| Cron mengembalikan 500 `CRON_SECRET is not configured` | Env var belum diisi di Vercel. |
-| `errors` berisi `Discord API 403` | Bot belum punya izin **View Channel** dan **Send Messages** di channel itu. |
-| `errors` berisi `Discord API 404` | Channel sudah dihapus atau ID salah. |
-| Role tidak menimbulkan notifikasi | Aktifkan **Allow anyone to @mention this role** pada role itu, atau beri role bot izin **Mention @everyone, @here, and All Roles**. |
-| Reminder terlambat beberapa menit | Ketepatan bergantung pada layanan cron eksternal. Pesan tetap menampilkan jam jadwal yang benar. Naikkan `CATCHUP_MINUTES` bila sering terlewat. |
+| Discord rejects the Interactions Endpoint URL | `DISCORD_PUBLIC_KEY` is not set or you have not redeployed. Or Vercel's **Deployment Protection** is blocking the request: open Settings → Deployment Protection and turn off Vercel Authentication for production. Check with `curl -X POST https://.../api/interactions`; the result must be `invalid request signature`, not an HTML login page. |
+| `The application did not respond` | Discord needs a reply within 3 seconds. Check **Vercel → Logs**. Usually `DATABASE_URL` is wrong or the database is slow on a cold start. Try again; the second request is usually faster. |
+| `/reminder` does not appear | Run `npm run deploy-commands`, then restart Discord (Ctrl+R). |
+| `/find_schedule` stays on "thinking..." or returns an error | Check **Vercel → Logs**. `Access Denied` means the notice site rejected the request. A timeout means the site was too slow (the lookup is cut off after 45 seconds). |
+| Cron test run returns 401 | The `Authorization` header is wrong or `CRON_SECRET` on Vercel is different. Redeploy after changing an environment variable. |
+| Cron returns 500 `CRON_SECRET is not configured` | The environment variable is not set on Vercel. |
+| `errors` contains `Discord API 403` | The bot lacks **View Channel** and **Send Messages** permission in that channel. |
+| `errors` contains `Discord API 404` | The channel was deleted or the ID is wrong. |
+| A role does not trigger a notification | Enable **Allow anyone to @mention this role** on that role, or give the bot's role the **Mention @everyone, @here, and All Roles** permission. |
+| Reminder is a few minutes late | Accuracy depends on the external cron service. The message still shows the correct scheduled time. Increase `CATCHUP_MINUTES` if reminders are often missed. |
 
-## Catatan
+## Notes
 
-- Vercel Hobby hanya untuk penggunaan non-komersial.
-- cron-job.org membatasi timeout tiap request 30 detik; fungsi ini selesai jauh lebih cepat.
-- Satu hal tetap di luar kendali: kalau layanan cron eksternal sedang gangguan lebih lama dari `CATCHUP_MINUTES`, reminder pada rentang itu terlewat dan tidak dikirim susulan.
-- **Keamanan:** jangan commit `.env`. Kalau token bot atau connection string pernah terbagi (misalnya terunggah ke chat atau repo publik), reset segera.
+- Vercel Hobby is for non-commercial use only.
+- cron-job.org limits each request to a 30-second timeout; this function finishes well within that.
+- One thing remains outside our control: if the external cron service is down for longer than `CATCHUP_MINUTES`, reminders in that period are missed and are not sent afterwards.
+- **Security:** do not commit `.env`. If the bot token or connection string was ever shared (for example uploaded to a chat or a public repo), reset it immediately.

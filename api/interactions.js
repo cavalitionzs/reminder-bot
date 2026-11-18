@@ -1,10 +1,23 @@
 const { DateTime, IANAZone } = require('luxon');
-const { verifySignature, getRawBody } = require('../lib/discord');
-const { addReminder, listReminders, deleteReminder } = require('../lib/db');
+const {
+  verifySignature,
+  getRawBody,
+  editOriginalResponse,
+} = require('../lib/discord');
+const {
+  addReminder,
+  listReminders,
+  deleteReminder,
+  getReminder,
+  updateMaintenanceTime,
+} = require('../lib/db');
+const { findSchedule, parseUtcTime } = require('../lib/maintenance');
+const { runInBackground } = require('../lib/background');
 
 const EPHEMERAL = 64; // MessageFlags.Ephemeral
 const DAY_NAMES = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const DEFAULT_MAINTENANCE_MESSAGE = '🔧 Maintenance schedule reminder';
 
 function reply(content) {
   return { type: 4, data: { content, flags: EPHEMERAL } };
@@ -71,7 +84,7 @@ async function handleReminder(interaction) {
 
     const lines = rows.map(
       (r) =>
-        `**#${r.id}** · ${DAY_NAMES[Number(r.weekday)]} ${r.reminder_time} · ${r.timezone} · <#${r.channel_id}>` +
+        `**#${r.id}**${r.kind === 'maintenance' ? ' 🔧' : ''} · ${DAY_NAMES[Number(r.weekday)]} ${r.reminder_time} · ${r.timezone} · <#${r.channel_id}>` +
         `${r.role_id ? ` · role <@&${r.role_id}>` : ''}` +
         `${r.user_id ? ' · mention enabled' : ''}\n└ ${r.message}`,
     );
@@ -111,6 +124,110 @@ async function handleReminder(interaction) {
   return reply('Unknown subcommand.');
 }
 
+const weekdayName = (weekday) =>
+  DateTime.fromObject({ weekday: Number(weekday) }).setLocale('en').toFormat('cccc');
+
+// /find_schedule: reading the notice site can take longer than Discord's 3s
+// limit, so answer with a "thinking..." placeholder (type 5) and replace it
+// with the result once the lookup finishes.
+function handleFindSchedule(interaction) {
+  runInBackground(
+    (async () => {
+      let content;
+      try {
+        const result = await findSchedule();
+        if (!result.found) {
+          content = 'No article with a parsable "Maintenance Schedule" was found.';
+        } else {
+          const { item } = result;
+          content = `**${result.hour}**\n└ ${item.title} (${item.status})`;
+        }
+      } catch (error) {
+        console.error('find_schedule failed:', error);
+        content = `Could not fetch the maintenance schedule: ${error.message}`.slice(0, 1900);
+      }
+      try {
+        await editOriginalResponse(interaction.application_id, interaction.token, {
+          content,
+          allowed_mentions: { parse: [] },
+        });
+      } catch (error) {
+        console.error('Could not send find_schedule result:', error.message);
+      }
+    })(),
+  );
+  return { type: 5, data: { flags: EPHEMERAL } };
+}
+
+async function handleMaintenanceSchedule(interaction) {
+  if (!interaction.guild_id) {
+    return reply('This command can only be used in a server.');
+  }
+  const opts = optionsMap(interaction.data.options);
+  const userId =
+    (interaction.member && interaction.member.user && interaction.member.user.id) ||
+    (interaction.user && interaction.user.id);
+
+  const time = parseUtcTime(opts.time);
+  if (!time) {
+    return reply('Invalid time. Use 24-hour UTC HH:mm, e.g. 09:00 or 09:00 UTC.');
+  }
+  const weekday = Number(opts.weekday);
+  const mention = opts.mention === true;
+
+  const inserted = await addReminder({
+    guild_id: interaction.guild_id,
+    channel_id: opts.channel,
+    user_id: mention ? userId : null,
+    role_id: opts.role || null,
+    message: opts.message || DEFAULT_MAINTENANCE_MESSAGE,
+    weekday,
+    time,
+    timezone: 'UTC',
+    kind: 'maintenance',
+  });
+
+  return reply(
+    `Maintenance schedule **#${inserted[0].id}** created: **${weekdayName(weekday)} ${time} UTC** in <#${opts.channel}>` +
+      `${opts.role ? `, mentioning <@&${opts.role}>` : ''}` +
+      `${mention ? ', mentioning you' : ''}.\n` +
+      `Change the time later with \`/maintenance_schedule_update id:${inserted[0].id}\`.`,
+  );
+}
+
+async function handleMaintenanceScheduleUpdate(interaction) {
+  if (!interaction.guild_id) {
+    return reply('This command can only be used in a server.');
+  }
+  const opts = optionsMap(interaction.data.options);
+  const id = opts.id;
+
+  const time = parseUtcTime(opts.time);
+  if (!time) {
+    return reply('Invalid time. Use 24-hour UTC HH:mm, e.g. 09:00 or 09:00 UTC.');
+  }
+
+  const rows = await getReminder(id, interaction.guild_id);
+  const existing = rows[0];
+  if (!existing) {
+    return reply(`Maintenance schedule **#${id}** was not found in this server.`);
+  }
+  if (existing.kind !== 'maintenance') {
+    return reply(
+      `**#${id}** is a regular reminder, not a maintenance schedule. Create one with \`/maintenance_schedule\`.`,
+    );
+  }
+
+  const updated = await updateMaintenanceTime(id, interaction.guild_id, time);
+  if (!updated) {
+    return reply(`Maintenance schedule **#${id}** was not found in this server.`);
+  }
+  return reply(
+    `Maintenance schedule **#${id}** updated: **${weekdayName(existing.weekday)} ${time} UTC** ` +
+      `(was ${existing.reminder_time} ${existing.timezone}).`,
+  );
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     res.statusCode = 405;
@@ -148,6 +265,24 @@ module.exports = async (req, res) => {
       interaction.data.name === 'reminder'
     ) {
       payload = await handleReminder(interaction);
+    } else if (
+      interaction.type === 2 &&
+      interaction.data &&
+      interaction.data.name === 'find_schedule'
+    ) {
+      payload = handleFindSchedule(interaction);
+    } else if (
+      interaction.type === 2 &&
+      interaction.data &&
+      interaction.data.name === 'maintenance_schedule'
+    ) {
+      payload = await handleMaintenanceSchedule(interaction);
+    } else if (
+      interaction.type === 2 &&
+      interaction.data &&
+      interaction.data.name === 'maintenance_schedule_update'
+    ) {
+      payload = await handleMaintenanceScheduleUpdate(interaction);
     } else {
       payload = reply('Unsupported interaction.');
     }

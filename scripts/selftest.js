@@ -20,7 +20,7 @@ require.cache[dbPath] = {
   exports: {
     getActiveReminders: async () => store.reminders.map((r) => ({ ...r })),
     addReminder: async (r) => {
-      const row = { id: String(store.nextId++), user_id: null, role_id: null, last_sent_date: null, ...r, reminder_time: r.time };
+      const row = { id: String(store.nextId++), user_id: null, role_id: null, last_sent_date: null, kind: 'reminder', ...r, reminder_time: r.time };
       store.reminders.push(row);
       return [{ id: row.id }];
     },
@@ -29,6 +29,12 @@ require.cache[dbPath] = {
       const n = store.reminders.length;
       store.reminders = store.reminders.filter((r) => !(r.id === String(id) && r.guild_id === g));
       return n - store.reminders.length;
+    },
+    getReminder: async (id, g) => store.reminders.filter((r) => r.id === String(id) && r.guild_id === g).map((r) => ({ ...r })),
+    updateMaintenanceTime: async (id, g, time) => {
+      const r = store.reminders.find((x) => x.id === String(id) && x.guild_id === g && x.kind === 'maintenance');
+      if (!r) return 0;
+      r.reminder_time = time; r.timezone = 'UTC'; r.last_sent_date = null; return 1;
     },
     claimReminder: async (id, d) => {
       const r = store.reminders.find((x) => x.id === String(id));
@@ -49,6 +55,12 @@ global.fetch = async (url, init) => {
   sentMessages.push({ url, body: JSON.parse(init.body) });
   return { ok: true, status: 200, json: async () => ({ id: '1' }) };
 };
+
+let lookup = async () => ({ found: false });
+const maintPath = require.resolve('../lib/maintenance');
+const realMaint = require('../lib/maintenance');
+require.cache[maintPath].exports = { ...realMaint, findSchedule: (...a) => lookup(...a) };
+const background = require('../lib/background');
 
 const { verifySignature } = require('../lib/discord');
 const { dueOccurrence } = require('../lib/schedule');
@@ -203,6 +215,103 @@ async function t(name, fn) { await fn(); passed++; console.log('  ok  -', name);
     const res = mockRes();
     await interactions(signed(cmd('delete', [{ name: 'id', type: 4, value: 1 }])), res);
     assert.ok(JSON.parse(res.body).data.content.includes('deleted'));
+  });
+
+  console.log('Maintenance schedule feature');
+  sentMessages.length = 0;
+  const mcmd = (name, options, extra = {}) => ({
+    type: 2, guild_id: 'G1', application_id: 'APP1', token: 'TOK1', member: { user: { id: 'U1' } },
+    data: { name, options }, ...extra,
+  });
+  const run = async (body) => { const res = mockRes(); await interactions(signed(body), res); return JSON.parse(res.body); };
+
+  await t('checker parses article text into end hour "09:00 UTC"', async () => {
+    const checker = require('../lib/maintenance_checker');
+    const text = checker.htmlToText('<p>✦ Maintenance Schedule</p><p>- November 19 (Thu) 01:00 - 09:00 (UTC) (8 hours)</p>');
+    const parsed = checker.parseSchedule(text, new Date('2026-11-18T05:00:00Z'));
+    assert.strictEqual(parsed.end.toISOString(), '2026-11-19T09:00:00.000Z');
+    assert.strictEqual(realMaint.formatUtcHour(parsed.end.toISOString()), '09:00 UTC');
+  });
+  await t('parseUtcTime accepts 9:00, "09:00 UTC", ISO; rejects junk', async () => {
+    assert.strictEqual(realMaint.parseUtcTime('9:00'), '09:00');
+    assert.strictEqual(realMaint.parseUtcTime('09:00 UTC'), '09:00');
+    assert.strictEqual(realMaint.parseUtcTime('2026-11-19T09:00:00.000Z'), '09:00');
+    assert.strictEqual(realMaint.parseUtcTime('24:00'), null);
+    assert.strictEqual(realMaint.parseUtcTime('abc'), null);
+  });
+  await t('/find_schedule defers (type 5) then edits the reply with "09:00 UTC"', async () => {
+    lookup = async () => ({ found: true, hour: '09:00 UTC', item: { title: 'Maintenance Notice (Version 1.2)', status: 'upcoming' } });
+    const out = await run(mcmd('find_schedule', []));
+    assert.strictEqual(out.type, 5);
+    await background.idle();
+    const m = sentMessages[sentMessages.length - 1];
+    assert.ok(m.url.endsWith('/webhooks/APP1/TOK1/messages/@original'), m.url);
+    assert.ok(m.body.content.startsWith('**09:00 UTC**'), m.body.content);
+  });
+  await t('/find_schedule reports when nothing is found', async () => {
+    lookup = async () => ({ found: false });
+    await run(mcmd('find_schedule', [])); await background.idle();
+    assert.ok(sentMessages[sentMessages.length - 1].body.content.includes('No article'));
+  });
+  await t('/find_schedule reports lookup errors instead of hanging', async () => {
+    lookup = async () => { throw new Error('Access Denied'); };
+    const out = await run(mcmd('find_schedule', [])); await background.idle();
+    assert.strictEqual(out.type, 5);
+    assert.ok(sentMessages[sentMessages.length - 1].body.content.includes('Access Denied'));
+  });
+  await t('/maintenance_schedule creates a UTC maintenance row', async () => {
+    store.reminders = [];
+    const out = await run(mcmd('maintenance_schedule', [
+      { name: 'weekday', type: 3, value: '4' }, { name: 'time', type: 3, value: '9:00 UTC' },
+      { name: 'channel', type: 7, value: 'C9' }, { name: 'role', type: 8, value: 'R9' },
+    ]));
+    assert.ok(out.data.content.includes('Thursday 09:00 UTC'), out.data.content);
+    const row = store.reminders[0];
+    assert.strictEqual(row.kind, 'maintenance'); assert.strictEqual(row.timezone, 'UTC');
+    assert.strictEqual(row.reminder_time, '09:00'); assert.ok(row.message.length > 0);
+  });
+  await t('/maintenance_schedule rejects invalid time', async () => {
+    const out = await run(mcmd('maintenance_schedule', [
+      { name: 'weekday', type: 3, value: '4' }, { name: 'time', type: 3, value: '99:00' },
+      { name: 'channel', type: 7, value: 'C9' },
+    ]));
+    assert.ok(out.data.content.startsWith('Invalid time'));
+  });
+  await t('/maintenance_schedule_update changes the UTC time by id', async () => {
+    const id = Number(store.reminders[0].id);
+    store.reminders[0].last_sent_date = '2026-11-19';
+    const out = await run(mcmd('maintenance_schedule_update', [
+      { name: 'id', type: 4, value: id }, { name: 'time', type: 3, value: '10:30' },
+    ]));
+    assert.ok(out.data.content.includes('Thursday 10:30 UTC') && out.data.content.includes('was 09:00'), out.data.content);
+    assert.strictEqual(store.reminders[0].reminder_time, '10:30');
+    assert.strictEqual(store.reminders[0].last_sent_date, null);
+  });
+  await t('update: unknown id, invalid time, and regular reminder are refused', async () => {
+    let out = await run(mcmd('maintenance_schedule_update', [{ name: 'id', type: 4, value: 999 }, { name: 'time', type: 3, value: '10:00' }]));
+    assert.ok(out.data.content.includes('not found'));
+    out = await run(mcmd('maintenance_schedule_update', [{ name: 'id', type: 4, value: 1 }, { name: 'time', type: 3, value: 'xx' }]));
+    assert.ok(out.data.content.startsWith('Invalid time'));
+    store.reminders.push({ id: '50', guild_id: 'G1', kind: 'reminder', weekday: 1, reminder_time: '02:00', timezone: 'UTC' });
+    out = await run(mcmd('maintenance_schedule_update', [{ name: 'id', type: 4, value: 50 }, { name: 'time', type: 3, value: '10:00' }]));
+    assert.ok(out.data.content.includes('regular reminder'));
+    assert.strictEqual(store.reminders.find((r) => r.id === '50').reminder_time, '02:00');
+  });
+  await t('update cannot touch another server\'s schedule', async () => {
+    const id = Number(store.reminders[0].id);
+    const body = mcmd('maintenance_schedule_update', [{ name: 'id', type: 4, value: id }, { name: 'time', type: 3, value: '01:00' }], { guild_id: 'OTHER' });
+    const out = await run(body);
+    assert.ok(out.data.content.includes('not found'));
+    assert.strictEqual(store.reminders[0].reminder_time, '10:30');
+  });
+  await t('cron fires the maintenance schedule at its UTC time', async () => {
+    store.reminders = store.reminders.filter((r) => r.kind === 'maintenance');
+    store.reminders[0].reminder_time = '09:00';
+    sentMessages.length = 0;
+    freeze('2026-11-19T09:00:10Z'); // Thursday
+    const res = mockRes(); await cron(cronReq({ authorization: 'Bearer test-secret' }), res);
+    assert.strictEqual(JSON.parse(res.body).sent.length, 1);
+    assert.ok(sentMessages[0].body.content.startsWith('<@&R9> '));
   });
 
   console.log(`\nAll ${passed} checks passed.`);

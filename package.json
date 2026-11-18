@@ -8,8 +8,11 @@
     "deploy-commands": "node scripts/deploy-commands.js",
     "test": "node scripts/selftest.js"
   },
-  "engines": { "node": "22.x" },
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
+    "@vercel/functions": "^3.11.3",
     "luxon": "^3.6.1",
     "pg": "^8.23.1"
   },

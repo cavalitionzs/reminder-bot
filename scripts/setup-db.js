@@ -29,13 +29,16 @@ CREATE TABLE IF NOT EXISTS reminders (
 -- For tables created by the older version of this project:
 ALTER TABLE reminders ADD COLUMN IF NOT EXISTS role_id VARCHAR(30);
 
+-- 'reminder' = /reminder add, 'maintenance' = /maintenance_schedule
+ALTER TABLE reminders ADD COLUMN IF NOT EXISTS kind VARCHAR(20) NOT NULL DEFAULT 'reminder';
+
 CREATE INDEX IF NOT EXISTS idx_reminders_active
   ON reminders (is_active, guild_id, weekday, reminder_time);
 `;
 
 pool
   .query(sql)
-  .then(() => console.log('Table "reminders" is ready (with role_id).'))
+  .then(() => console.log('Table "reminders" is ready (with role_id and kind).'))
   .catch((e) => {
     console.error('Failed:', e.message);
     process.exitCode = 1;
