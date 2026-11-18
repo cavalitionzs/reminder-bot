@@ -12,11 +12,23 @@ const {
   updateMaintenanceTime,
 } = require('../lib/db');
 const { findSchedule, parseUtcTime } = require('../lib/maintenance');
+const { resolveRecurrence } = require('../lib/schedule');
 const { runInBackground } = require('../lib/background');
 
 const EPHEMERAL = 64; // MessageFlags.Ephemeral
 const DAY_NAMES = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+// How a reminder repeats: run_date set = one-time, weekday NULL = daily,
+// weekday 1-7 = weekly (see lib/schedule.js).
+const fullDay = (weekday) =>
+  DateTime.fromObject({ weekday: Number(weekday) }).setLocale('en').toFormat('cccc');
+const isDaily = (r) => (r.weekday === null || r.weekday === undefined) && !r.run_date;
+const dayLabel = (r) =>
+  r.run_date
+    ? `${fullDay(r.weekday)} ${String(r.run_date).slice(0, 10)} (one-time)`
+    : isDaily(r)
+      ? 'Every day'
+      : `Every ${fullDay(r.weekday)}`;
 const DEFAULT_MAINTENANCE_MESSAGE = '🔧 Maintenance schedule reminder';
 
 function reply(content) {
@@ -45,7 +57,6 @@ async function handleReminder(interaction) {
     (interaction.user && interaction.user.id);
 
   if (sub.name === 'add') {
-    const weekday = Number(opts.weekday);
     const time = opts.time;
     const timezone = opts.timezone || defaultTimezone;
     const mention = opts.mention === true;
@@ -56,6 +67,8 @@ async function handleReminder(interaction) {
     if (!IANAZone.isValidZone(timezone)) {
       return reply(`Invalid timezone: ${timezone}. Example: Asia/Jakarta`);
     }
+    const recurrence = resolveRecurrence(opts.weekday, opts.date, time, timezone);
+    if (recurrence.error) return reply(recurrence.error);
 
     const inserted = await addReminder({
       guild_id: guildId,
@@ -63,16 +76,14 @@ async function handleReminder(interaction) {
       user_id: mention ? userId : null,
       role_id: opts.role || null,
       message: opts.message,
-      weekday,
+      weekday: recurrence.weekday,
+      run_date: recurrence.run_date,
       time,
       timezone,
     });
 
-    const weekdayName = DateTime.fromObject({ weekday })
-      .setLocale('en')
-      .toFormat('cccc');
     return reply(
-      `Reminder **#${inserted[0].id}** created: **${weekdayName} ${time}** (${timezone}) in <#${opts.channel}>` +
+      `Reminder **#${inserted[0].id}** created: **${dayLabel(recurrence)} ${time}** (${timezone}) in <#${opts.channel}>` +
         `${opts.role ? `, mentioning <@&${opts.role}>` : ''}` +
         `${mention ? ', mentioning you' : ''}.`,
     );
@@ -84,7 +95,7 @@ async function handleReminder(interaction) {
 
     const lines = rows.map(
       (r) =>
-        `**#${r.id}**${r.kind === 'maintenance' ? ' 🔧' : ''} · ${DAY_NAMES[Number(r.weekday)]} ${r.reminder_time} · ${r.timezone} · <#${r.channel_id}>` +
+        `**#${r.id}**${r.kind === 'maintenance' ? ' 🔧' : ''} · ${r.run_date ? `${DAY_NAMES[Number(r.weekday)]} ${String(r.run_date).slice(0, 10)} (once)` : isDaily(r) ? 'Daily' : `Every ${DAY_NAMES[Number(r.weekday)]}`} ${r.reminder_time} · ${r.timezone} · <#${r.channel_id}>` +
         `${r.role_id ? ` · role <@&${r.role_id}>` : ''}` +
         `${r.user_id ? ' · mention enabled' : ''}\n└ ${r.message}`,
     );
@@ -95,7 +106,7 @@ async function handleReminder(interaction) {
         flags: EPHEMERAL,
         embeds: [
           {
-            title: 'Weekly reminders',
+            title: 'Reminders',
             description: lines.join('\n\n').slice(0, 4000),
             color: 0x7652d4,
           },
@@ -123,9 +134,6 @@ async function handleReminder(interaction) {
 
   return reply('Unknown subcommand.');
 }
-
-const weekdayName = (weekday) =>
-  DateTime.fromObject({ weekday: Number(weekday) }).setLocale('en').toFormat('cccc');
 
 // /find_schedule: reading the notice site can take longer than Discord's 3s
 // limit, so answer with a "thinking..." placeholder (type 5) and replace it
@@ -172,8 +180,13 @@ async function handleMaintenanceSchedule(interaction) {
   if (!time) {
     return reply('Invalid time. Use 24-hour UTC HH:mm, e.g. 09:00 or 09:00 UTC.');
   }
-  const weekday = Number(opts.weekday);
   const mention = opts.mention === true;
+
+  // Maintenance schedules never repeat weekly (that is /reminder add). With a
+  // date they fire only on that day; without one they fire every day.
+  const hasDate = opts.date !== undefined && opts.date !== null && String(opts.date).trim() !== '';
+  const recurrence = resolveRecurrence(hasDate ? undefined : 'daily', opts.date, time, 'UTC');
+  if (recurrence.error) return reply(recurrence.error);
 
   const inserted = await addReminder({
     guild_id: interaction.guild_id,
@@ -181,14 +194,15 @@ async function handleMaintenanceSchedule(interaction) {
     user_id: mention ? userId : null,
     role_id: opts.role || null,
     message: opts.message || DEFAULT_MAINTENANCE_MESSAGE,
-    weekday,
+    weekday: recurrence.weekday,
+    run_date: recurrence.run_date,
     time,
     timezone: 'UTC',
     kind: 'maintenance',
   });
 
   return reply(
-    `Maintenance schedule **#${inserted[0].id}** created: **${weekdayName(weekday)} ${time} UTC** in <#${opts.channel}>` +
+    `Maintenance schedule **#${inserted[0].id}** created: **${dayLabel(recurrence)} ${time} UTC** in <#${opts.channel}>` +
       `${opts.role ? `, mentioning <@&${opts.role}>` : ''}` +
       `${mention ? ', mentioning you' : ''}.\n` +
       `Change the time later with \`/maintenance_schedule_update id:${inserted[0].id}\`.`,
@@ -218,12 +232,26 @@ async function handleMaintenanceScheduleUpdate(interaction) {
     );
   }
 
+  if (existing.run_date) {
+    if (existing.is_active === false) {
+      return reply(
+        `Maintenance schedule **#${id}** is one-time and was already sent or has passed, so it can't be changed. ` +
+          'Create a new one with `/maintenance_schedule`.',
+      );
+    }
+    const [hour, minute] = time.split(':').map(Number);
+    const moment = DateTime.fromISO(String(existing.run_date).slice(0, 10), { zone: 'UTC' }).set({ hour, minute });
+    if (moment <= DateTime.utc()) {
+      return reply(`${String(existing.run_date).slice(0, 10)} ${time} UTC has already passed. Choose a later time.`);
+    }
+  }
+
   const updated = await updateMaintenanceTime(id, interaction.guild_id, time);
   if (!updated) {
     return reply(`Maintenance schedule **#${id}** was not found in this server.`);
   }
   return reply(
-    `Maintenance schedule **#${id}** updated: **${weekdayName(existing.weekday)} ${time} UTC** ` +
+    `Maintenance schedule **#${id}** updated: **${dayLabel(existing)} ${time} UTC** ` +
       `(was ${existing.reminder_time} ${existing.timezone}).`,
   );
 }

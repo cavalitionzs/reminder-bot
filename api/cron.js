@@ -4,9 +4,10 @@ const {
   getActiveReminders,
   claimReminder,
   releaseClaim,
+  deactivateReminder,
 } = require('../lib/db');
 const { sendChannelMessage } = require('../lib/discord');
-const { dueOccurrence } = require('../lib/schedule');
+const { dueOccurrence, isExpiredOnce } = require('../lib/schedule');
 
 function safeEqual(a, b) {
   // Hash first so both buffers have equal length for timingSafeEqual.
@@ -47,7 +48,7 @@ module.exports = async (req, res) => {
 
   const windowMinutes = Math.max(1, Number(process.env.CATCHUP_MINUTES) || 5);
   const nowUtc = DateTime.utc();
-  const result = { checked: 0, sent: [], skipped: 0, errors: [] };
+  const result = { checked: 0, sent: [], skipped: 0, expired: [], errors: [] };
 
   try {
     const reminders = await getActiveReminders();
@@ -55,7 +56,14 @@ module.exports = async (req, res) => {
 
     for (const reminder of reminders) {
       const due = dueOccurrence(reminder, nowUtc, windowMinutes);
-      if (!due) continue;
+      if (!due) {
+        // A one-time reminder that was missed can never fire again: switch it off.
+        if (isExpiredOnce(reminder, nowUtc, windowMinutes)) {
+          await deactivateReminder(reminder.id).catch(() => {});
+          result.expired.push(reminder.id);
+        }
+        continue;
+      }
 
       const previous = reminder.last_sent_date
         ? String(reminder.last_sent_date).slice(0, 10)
@@ -89,6 +97,7 @@ module.exports = async (req, res) => {
           },
         });
         result.sent.push(reminder.id);
+        if (reminder.run_date) await deactivateReminder(reminder.id).catch(() => {}); // one-time: done
         console.log(`Sent reminder #${reminder.id} for ${due.scheduled.toISO()}`);
       } catch (error) {
         console.error(`Could not send reminder #${reminder.id}:`, error.message);
